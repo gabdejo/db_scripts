@@ -1,7 +1,7 @@
 # scripts/migrate/add_security_extensions.py
 # ---------------------------------------------------------------
 # Schema migration: adds new security extension tables.
-# Does NOT touch fact_prices or any fact table.
+# Does NOT touch fact_prices or any other fact table.
 # Safe to run multiple times (IF NOT EXISTS guards).
 #
 # New tables:
@@ -10,7 +10,8 @@
 #   dim_security_rate_index
 #   dim_security_index
 #
-# No ALTER TABLE needed - end_date removed from design.
+# Run once:
+#   python scripts/migrate/add_security_extensions.py
 # ---------------------------------------------------------------
 
 import logging
@@ -98,11 +99,15 @@ def run_migration() -> None:
             conn.execute(sql.strip())
             logger.info(f"Ensured table: {table_name}")
 
-        # Verify fact_prices untouched
-        count = conn.execute(
-            "SELECT COUNT(*) FROM fact_prices"
-        ).fetchone()[0]
-        logger.info(f"fact_prices rows (unchanged): {count:,}")
+        # Verify fact tables untouched
+        for fact_table in ("fact_prices", "fact_macro", "fact_fundamentals"):
+            try:
+                count = conn.execute(
+                    f"SELECT COUNT(*) FROM {fact_table}"
+                ).fetchone()[0]
+                logger.info(f"{fact_table} rows (unchanged): {count:,}")
+            except Exception:
+                logger.info(f"{fact_table}: table not found, skipping count.")
 
     logger.info("=== Migration complete ===")
 
