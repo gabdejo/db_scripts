@@ -3,19 +3,25 @@
 # Shared SBS universe registration logic.
 # Called as Step 1 in each SBS pipeline run() before _classify().
 #
-# Discovers new instruments from the raw file DataFrame,
-# diffs against already-registered codigo_sbs values in the DB,
-# and registers new instruments directly into:
-#   dim_entity
-#   dim_entity_identifiers  (codigo_sbs + isin)
-#   dim_security            (skeleton only)
-#   series_registry         (one row per field, status=backfill-pending)
+# Registration runs in two passes per file:
+#   Pass 1: normal ISIN instruments - resolve against existing
+#           dim_entity_identifiers or create new entities.
+#   Pass 2: X-ISIN instruments - always create separate entities
+#           (schema constraint: entity+field+source must be unique,
+#           so two codigo_sbs variants of the same bond cannot
+#           share an entity_id in series_registry).
+#           Attempts parent ISIN prefix lookup for Bloomberg
+#           enrichment linkage. Flags unresolved cases.
 #
-# Bypasses series.csv entirely - SBS universe is discovered
-# from the regulator files, not manually curated.
+# X-ISIN definition:
+#   SBS replaces the check digit (last char) of a real ISIN with 'X'
+#   to denote a regulatory variant. e.g. CA4436281022 -> CA443628102X
+#   The first 11 characters identify the parent bond.
+#   X-ISINs are stored as id_type='isin_x'.
+#   Parent prefix stored as id_type='isin_prefix' for Bloomberg linkage.
 #
-# created_at in series_registry records when each instrument
-# first appeared in the SBS files, providing the audit trail.
+# Bypasses series.csv - SBS universe is discovered from files.
+# created_at in series_registry provides the audit trail.
 # ---------------------------------------------------------------
 
 import logging
@@ -25,17 +31,19 @@ from typing import Optional
 import pandas as pd
 
 from src.db.session import get_connection
-from src.db.queries import get_or_create_entity_id, upsert_entity_identifier
+from src.db.queries import (
+    get_or_create_entity_id,
+    upsert_entity_identifier,
+    resolve_entity_id_from_identifier,
+)
 
 logger = logging.getLogger(__name__)
 
 
 # ---- Field sets per file type ---------------------------------
-# Maps file type name to the series fields that should be
-# registered in series_registry for each instrument.
 
 FILE_TYPE_FIELDS = {
-    "vector_completo": ["PX_LAST"],
+    "vector_completo": ["PX_LAST", "CHG_PRICE"],
     "rf_local": [
         "PX_CLEAN_MNT", "PX_CLEAN_PCT",
         "PX_DIRTY_MNT", "PX_DIRTY_PCT",
@@ -66,15 +74,11 @@ def discover_and_register(
     Discovers new instruments in raw_df and registers them in the DB.
     Called as Step 1 in each SBS pipeline run() before _classify().
 
-    raw_df:    raw DataFrame from read_raw() in extract.py.
-               Must contain at minimum: codigo_sbs, isin (optional),
-               tipo_instrumento (optional).
-               For tipo_cambio: moneda_nocional, moneda_contraparte, fuente.
+    Two-pass registration:
+      Pass 1: normal ISIN instruments
+      Pass 2: X-ISIN instruments (separate entities, Bloomberg linkage via prefix)
 
-    file_type: one of vector_completo, rf_local, rf_exterior, tipo_cambio.
-    run_date:  used as default_start_date for newly registered series.
-
-    Returns number of new series registered.
+    Returns total number of new series registered.
     """
     if raw_df.empty:
         logger.info(f"registry [{file_type}]: empty DataFrame, nothing to register.")
@@ -106,7 +110,7 @@ def discover_and_register(
         )
 
 
-# ---- Securities registration (vector_completo, rf_local, rf_exterior) --
+# ---- Securities registration -----------------------------------
 
 def _register_securities(
     raw_df: pd.DataFrame,
@@ -118,113 +122,245 @@ def _register_securities(
     frequency: str,
 ) -> int:
     """
-    Registers bond/equity securities from SBS files.
-    One entity per codigo_sbs, multiple series per entity (one per field).
+    Two-pass registration for bond/equity securities.
+
+    Pass 1: instruments with normal ISINs
+    Pass 2: instruments with X-ISINs (separate entities)
     """
-    # Get already-registered codigo_sbs values
+    # Get already-registered codigo_sbs values to skip known instruments
     with get_connection() as conn:
-        existing = _get_existing_sbs_codes(conn)
+        existing_codes = _get_existing_sbs_codes(conn)
 
     # Unique instruments in file
     instruments = (
-        raw_df[["codigo_sbs", "isin", "tipo_instrumento"]]
+        raw_df[["codigo_sbs", "isin", "tipo_instrumento", "emisor"]]
         .drop_duplicates(subset=["codigo_sbs"])
         .dropna(subset=["codigo_sbs"])
     )
 
     new_instruments = instruments[
-        ~instruments["codigo_sbs"].astype(str).isin(existing)
+        ~instruments["codigo_sbs"].astype(str).isin(existing_codes)
     ]
 
     if new_instruments.empty:
         logger.info(
-            f"registry [{file_type}]: no new instruments found "
+            f"registry [{file_type}]: no new instruments "
             f"({len(instruments)} already registered)."
         )
         return 0
 
     logger.info(
-        f"registry [{file_type}]: {len(new_instruments)} new instruments "
-        f"found in file. Registering..."
+        f"registry [{file_type}]: {len(new_instruments)} new instruments found."
     )
+
+    # Split into normal and X-ISIN
+    normal_rows = new_instruments[
+        ~new_instruments["isin"].apply(_is_x_isin)
+    ]
+    x_isin_rows = new_instruments[
+        new_instruments["isin"].apply(_is_x_isin)
+    ]
 
     registered = 0
 
-    with get_connection() as conn:
-        for _, row in new_instruments.iterrows():
-            codigo_sbs      = str(row["codigo_sbs"]).strip()
-            isin            = _clean(row.get("isin"))
-            tipo_instrumento = _clean(row.get("tipo_instrumento"))
-
-            # Internal code: SBS_{codigo_sbs}
-            internal_code = f"SBS_{codigo_sbs}"
-
-            # 1. dim_entity
-            entity_id = get_or_create_entity_id(
-                conn,
-                ticker=internal_code,
-                entity_type="security",
-                name=interno_name(row),
-            )
-
-            # 2. dim_entity_identifiers
-            upsert_entity_identifier(
-                conn, entity_id,
-                id_type="codigo_sbs",
-                id_value=codigo_sbs,
-                source="sbs",
-                is_primary=True,
-            )
-            if isin:
-                upsert_entity_identifier(
-                    conn, entity_id,
-                    id_type="isin",
-                    id_value=isin,
-                    source="sbs",
-                    is_primary=False,
+    # Pass 1: normal ISINs
+    if not normal_rows.empty:
+        logger.info(
+            f"registry [{file_type}]: Pass 1 - "
+            f"{len(normal_rows)} normal ISIN instruments."
+        )
+        with get_connection() as conn:
+            for _, row in normal_rows.iterrows():
+                registered += _register_normal_instrument(
+                    conn, row, fields, run_date, domain, source, frequency
                 )
 
-            # 3. dim_security skeleton
-            conn.execute(
-                """
-                INSERT INTO dim_security (entity_id, security_type)
-                VALUES (?, ?)
-                ON CONFLICT (entity_id) DO NOTHING
-                """,
-                (entity_id, tipo_instrumento),
-            )
-
-            # 4. series_registry - one row per field
-            for field in fields:
-                conn.execute(
-                    """
-                    INSERT INTO series_registry (
-                        entity_id, field, domain, source, frequency,
-                        default_start_date, status
-                    ) VALUES (?, ?, ?, ?, ?, ?, 'backfill-pending')
-                    ON CONFLICT (entity_id, field, source) DO NOTHING
-                    """,
-                    (
-                        entity_id, field, domain, source, frequency,
-                        run_date.isoformat(),
-                    ),
+    # Pass 2: X-ISINs (always separate entities, after Pass 1)
+    if not x_isin_rows.empty:
+        logger.info(
+            f"registry [{file_type}]: Pass 2 - "
+            f"{len(x_isin_rows)} X-ISIN instruments."
+        )
+        with get_connection() as conn:
+            for _, row in x_isin_rows.iterrows():
+                registered += _register_x_isin_instrument(
+                    conn, row, fields, run_date, domain, source, frequency
                 )
-                if conn.execute("SELECT changes()").fetchone()[0] > 0:
-                    registered += 1
-
-            logger.debug(
-                f"Registered: {internal_code} | codigo_sbs={codigo_sbs} "
-                f"| isin={isin} | {len(fields)} series"
-            )
 
     logger.info(
-        f"registry [{file_type}]: {len(new_instruments)} new instruments, "
-        f"{registered} new series registered."
+        f"registry [{file_type}]: {registered} new series registered."
     )
     return registered
 
 
-# ---- FX registration (tipo_cambio) -----------------------------
+def _register_normal_instrument(
+    conn,
+    row,
+    fields: list[str],
+    run_date: date,
+    domain: str,
+    source: str,
+    frequency: str,
+) -> int:
+    """
+    Registers a normal ISIN instrument.
+    Attempts to resolve against existing entity via ISIN.
+    Creates new entity if not found.
+    """
+    codigo_sbs       = str(row["codigo_sbs"]).strip()
+    isin             = _clean(row.get("isin"))
+    tipo_instrumento = _clean(row.get("tipo_instrumento"))
+
+    # Try to resolve existing entity via ISIN
+    entity_id = None
+    if isin:
+        entity_id = resolve_entity_id_from_identifier(
+            conn, id_type="isin", id_value=isin, source=None
+        )
+
+    if entity_id is None:
+        # New entity
+        internal_code = f"SBS_{codigo_sbs}"
+        entity_id = get_or_create_entity_id(
+            conn,
+            ticker=internal_code,
+            entity_type="security",
+            name=_derive_name(row),
+        )
+        # dim_security skeleton
+        conn.execute(
+            """
+            INSERT INTO dim_security (entity_id, security_type)
+            VALUES (?, ?)
+            ON CONFLICT (entity_id) DO NOTHING
+            """,
+            (entity_id, tipo_instrumento),
+        )
+    else:
+        logger.debug(
+            f"Linked SBS instrument {codigo_sbs} to existing "
+            f"entity_id={entity_id} via ISIN {isin}."
+        )
+
+    # Always store codigo_sbs on the entity (new or existing)
+    upsert_entity_identifier(
+        conn, entity_id, "codigo_sbs", codigo_sbs, "sbs", is_primary=True
+    )
+    # ISIN stored as source="internal" - universal standard identifier
+    if isin:
+        upsert_entity_identifier(
+            conn, entity_id, "isin", isin, "internal", is_primary=False
+        )
+
+    return _register_series(
+        conn, entity_id, fields, run_date, domain, source, frequency
+    )
+
+
+def _register_x_isin_instrument(
+    conn,
+    row,
+    fields: list[str],
+    run_date: date,
+    domain: str,
+    source: str,
+    frequency: str,
+) -> int:
+    """
+    Registers an X-ISIN instrument as a SEPARATE entity.
+
+    X-ISIN variants cannot share an entity with their parent because
+    series_registry requires unique (entity_id, field, source) and
+    both variants report the same fields from source='sbs'.
+
+    Attempts parent ISIN prefix lookup for Bloomberg enrichment linkage.
+    Stores parent_entity_id as a reference identifier if found.
+    Flags unresolved cases with a warning.
+    """
+    codigo_sbs       = str(row["codigo_sbs"]).strip()
+    isin_x           = _clean(row.get("isin"))
+    tipo_instrumento = _clean(row.get("tipo_instrumento"))
+
+    # Always create a new entity for this X-ISIN variant
+    internal_code = f"SBS_{codigo_sbs}"
+    entity_id = get_or_create_entity_id(
+        conn,
+        ticker=internal_code,
+        entity_type="security",
+        name=_derive_name(row),
+    )
+
+    # dim_security skeleton
+    conn.execute(
+        """
+        INSERT INTO dim_security (entity_id, security_type)
+        VALUES (?, ?)
+        ON CONFLICT (entity_id) DO NOTHING
+        """,
+        (entity_id, tipo_instrumento),
+    )
+
+    # Store X-ISIN and codigo_sbs
+    upsert_entity_identifier(
+        conn, entity_id, "codigo_sbs", codigo_sbs, "sbs", is_primary=True
+    )
+    if isin_x:
+        upsert_entity_identifier(
+            conn, entity_id, "isin_x", isin_x, "sbs", is_primary=False
+        )
+
+    # Attempt parent resolution via ISIN prefix (first 11 chars)
+    if isin_x:
+        prefix        = isin_x[:-1]   # strip the X
+        parent_entity = _resolve_by_isin_prefix(conn, prefix)
+
+        if parent_entity:
+            # Store parent entity reference for Bloomberg enrichment
+            # This is NOT a merge - just a hint for enrichment pipelines
+            upsert_entity_identifier(
+                conn, entity_id,
+                id_type="isin_prefix",
+                id_value=prefix,
+                source="sbs",
+                is_primary=False,
+            )
+            conn.execute(
+                """
+                INSERT INTO dim_entity_identifiers
+                    (entity_id, id_type, id_value, source, is_primary)
+                VALUES (?, 'parent_entity_id', ?, 'sbs', 0)
+                ON CONFLICT (entity_id, id_type, source) DO UPDATE SET
+                    id_value = excluded.id_value
+                """,
+                (entity_id, str(parent_entity)),
+            )
+            logger.debug(
+                f"X-ISIN {isin_x} (entity_id={entity_id}) linked to "
+                f"parent entity_id={parent_entity} via prefix {prefix}."
+            )
+        else:
+            # Store prefix only - flag for manual review
+            upsert_entity_identifier(
+                conn, entity_id,
+                id_type="isin_prefix",
+                id_value=prefix,
+                source="sbs",
+                is_primary=False,
+            )
+            logger.warning(
+                f"X-ISIN {isin_x} (codigo_sbs={codigo_sbs}): "
+                f"no parent entity found for prefix '{prefix}'. "
+                f"Bloomberg enrichment will not be linked until "
+                f"parent instrument is onboarded. "
+                f"entity_id={entity_id} flagged for manual review."
+            )
+
+    return _register_series(
+        conn, entity_id, fields, run_date, domain, source, frequency
+    )
+
+
+# ---- FX registration -------------------------------------------
 
 def _register_fx(
     raw_df: pd.DataFrame,
@@ -236,11 +372,11 @@ def _register_fx(
 ) -> int:
     """
     Registers FX currency pairs from tipo_cambio file.
-    Internal code: SBS_FX_{moneda_nocional}_{moneda_contraparte}_{fuente}
-    One entity per pair+source, multiple series per entity.
+    No ISIN, no X-ISIN logic - pairs are identified by
+    (moneda_nocional, moneda_contraparte, fuente).
     """
     with get_connection() as conn:
-        existing = _get_existing_sbs_codes(conn)
+        existing_codes = _get_existing_sbs_codes(conn)
 
     pairs = (
         raw_df[["moneda_nocional", "moneda_contraparte", "fuente"]]
@@ -256,14 +392,12 @@ def _register_fx(
             mc  = str(row["moneda_contraparte"]).strip()
             src = str(row["fuente"]).strip()
 
-            # Unique codigo for this pair+source
             codigo_sbs    = f"FX_{mn}_{mc}_{src}"
             internal_code = f"SBS_{codigo_sbs}"
 
-            if codigo_sbs in existing:
+            if codigo_sbs in existing_codes:
                 continue
 
-            # 1. dim_entity
             entity_id = get_or_create_entity_id(
                 conn,
                 ticker=internal_code,
@@ -271,42 +405,23 @@ def _register_fx(
                 name=f"{mn}/{mc} ({src})",
             )
 
-            # 2. dim_entity_identifiers
             upsert_entity_identifier(
-                conn, entity_id,
-                id_type="codigo_sbs",
-                id_value=codigo_sbs,
-                source="sbs",
-                is_primary=True,
+                conn, entity_id, "codigo_sbs", codigo_sbs, "sbs", True
             )
+            for id_type, id_value in [
+                ("moneda_nocional",    mn),
+                ("moneda_contraparte", mc),
+                ("fuente",             src),
+            ]:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO dim_entity_identifiers
+                        (entity_id, id_type, id_value, source, is_primary)
+                    VALUES (?, ?, ?, 'sbs', 0)
+                    """,
+                    (entity_id, id_type, id_value),
+                )
 
-            # Store pair components for pipeline lookup
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO dim_entity_identifiers
-                    (entity_id, id_type, id_value, source, is_primary)
-                VALUES (?, 'moneda_nocional',   ?, 'sbs', 0)
-                """,
-                (entity_id, mn),
-            )
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO dim_entity_identifiers
-                    (entity_id, id_type, id_value, source, is_primary)
-                VALUES (?, 'moneda_contraparte', ?, 'sbs', 0)
-                """,
-                (entity_id, mc),
-            )
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO dim_entity_identifiers
-                    (entity_id, id_type, id_value, source, is_primary)
-                VALUES (?, 'fuente',              ?, 'sbs', 0)
-                """,
-                (entity_id, src),
-            )
-
-            # 3. dim_security skeleton
             conn.execute(
                 """
                 INSERT INTO dim_security (entity_id, security_type)
@@ -316,7 +431,6 @@ def _register_fx(
                 (entity_id,),
             )
 
-            # 4. dim_security_fx
             sec = conn.execute(
                 "SELECT security_id FROM dim_security WHERE entity_id = ?",
                 (entity_id,),
@@ -332,37 +446,45 @@ def _register_fx(
                     (sec["security_id"], mn, mc, f"{mn}/{mc}"),
                 )
 
-            # 5. series_registry - one row per field
-            for field in fields:
-                # Store pair metadata on series for lookup in transform
-                conn.execute(
-                    """
-                    INSERT INTO series_registry (
-                        entity_id, field, domain, source, frequency,
-                        default_start_date, status
-                    ) VALUES (?, ?, ?, ?, ?, ?, 'backfill-pending')
-                    ON CONFLICT (entity_id, field, source) DO NOTHING
-                    """,
-                    (
-                        entity_id, field, domain, source, frequency,
-                        run_date.isoformat(),
-                    ),
-                )
-                if conn.execute("SELECT changes()").fetchone()[0] > 0:
-                    registered += 1
+            registered += _register_series(
+                conn, entity_id, fields, run_date, domain, source, frequency
+            )
 
-            logger.debug(f"Registered FX: {internal_code} | {len(fields)} series")
-
-    logger.info(
-        f"registry [tipo_cambio]: {registered} new series registered."
-    )
+    logger.info(f"registry [tipo_cambio]: {registered} new series registered.")
     return registered
 
 
-# ---- Helpers ---------------------------------------------------
+# ---- Shared helpers --------------------------------------------
+
+def _register_series(
+    conn,
+    entity_id: int,
+    fields: list[str],
+    run_date: date,
+    domain: str,
+    source: str,
+    frequency: str,
+) -> int:
+    """Inserts series_registry rows for each field. Returns count inserted."""
+    inserted = 0
+    for field in fields:
+        conn.execute(
+            """
+            INSERT INTO series_registry (
+                entity_id, field, domain, source, frequency,
+                default_start_date, status
+            ) VALUES (?, ?, ?, ?, ?, ?, 'backfill-pending')
+            ON CONFLICT (entity_id, field, source) DO NOTHING
+            """,
+            (entity_id, field, domain, source, frequency, run_date.isoformat()),
+        )
+        if conn.execute("SELECT changes()").fetchone()[0] > 0:
+            inserted += 1
+    return inserted
+
 
 def _get_existing_sbs_codes(conn) -> set[str]:
-    """Returns set of all codigo_sbs values already registered."""
+    """Returns all codigo_sbs values already registered."""
     rows = conn.execute(
         """
         SELECT id_value FROM dim_entity_identifiers
@@ -372,7 +494,41 @@ def _get_existing_sbs_codes(conn) -> set[str]:
     return {r["id_value"] for r in rows}
 
 
-def interno_name(row) -> Optional[str]:
+def _resolve_by_isin_prefix(conn, prefix: str) -> Optional[int]:
+    """
+    Finds entity_id whose ISIN starts with the given 11-char prefix.
+    Returns entity_id if exactly one match found, None otherwise.
+    Multiple matches are logged as a warning.
+    """
+    rows = conn.execute(
+        """
+        SELECT DISTINCT entity_id FROM dim_entity_identifiers
+        WHERE id_type = 'isin'
+          AND source  = 'internal'
+          AND substr(id_value, 1, 11) = ?
+        """,
+        (prefix,),
+    ).fetchall()
+
+    if len(rows) == 1:
+        return rows[0]["entity_id"]
+    if len(rows) > 1:
+        logger.warning(
+            f"ISIN prefix '{prefix}' matched {len(rows)} entities: "
+            f"{[r['entity_id'] for r in rows]}. Cannot resolve uniquely."
+        )
+    return None
+
+
+def _is_x_isin(val) -> bool:
+    """Returns True if val is an SBS X-ISIN (12 chars ending in X)."""
+    if val is None:
+        return False
+    s = str(val).strip().upper()
+    return len(s) == 12 and s.endswith("X")
+
+
+def _derive_name(row) -> Optional[str]:
     """Derives a human-readable name from available row attributes."""
     emisor = _clean(row.get("emisor"))
     tipo   = _clean(row.get("tipo_instrumento"))
