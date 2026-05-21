@@ -4,27 +4,25 @@
 #
 # FMS is a shared, stressed transactional system. Two rules
 # follow from that:
-#   1. Always go through call_sproc — never inline ad-hoc SQL.
+#   1. Always go through call_sproc - never inline ad-hoc SQL.
 #      Sprocs are the contract; ad-hoc queries break it and
 #      bypass DBA-controlled execution plans.
 #   2. Every connection has explicit login + query timeouts so
 #      a slow FMS doesn't hang the scheduler indefinitely.
 #
-# Connection settings live in machine_config under an `fms` block:
+# Auth is Windows (Trusted), so the connection string is pure
+# non-secret topology - see get_fms_connection_string() below for
+# where it lives and how to relocate it to config later.
 #
-#   fms:
-#     enabled: true
-#     driver: "ODBC Driver 17 for SQL Server"
-#     server: "fmsdb.internal"
-#     database: "FMS_PROD"
-#     auth: "windows"        # windows | sql
-#     username: null
-#     password: null
-#     query_timeout_s: 120
-#     login_timeout_s: 10
+# "Should this machine run FMS ingestion on a schedule" is a
+# separate, machine-specific concern - that belongs in
+# machine_config (e.g. fms_ingestion_enabled), NOT here. This
+# module only knows how to talk to FMS, not whether it should.
 #
-# assert_fms() mirrors assert_bloomberg / assert_scraper /
-# assert_automated_scraper. Pipelines call it at run() top.
+# Public sprocs (existing on FMS):
+#   sp_GetPositions     daily holdings per account
+#   sp_GetPortfolios    portfolio metadata
+#   sp_GetTransactions  trade-level data
 # ---------------------------------------------------------------
 
 import logging
@@ -34,70 +32,60 @@ from typing import Any, Iterator
 
 import pyodbc
 
-from src.configs.machine_config import load_machine_config
-
 logger = logging.getLogger(__name__)
 
 
-class FMSConfigError(RuntimeError):
-    pass
+# ---------------------------------------------------------------
+# Connection topology.
+#
+# FMS uses Windows (Trusted) auth, so this string carries no
+# secret - it's just server + database coordinates, identical on
+# every machine. It lives here as a constant for now.
+#
+# If the topology ever moves (DB migration, a read replica stood
+# up to take load off the transactional instance, prod/DR
+# failover), relocate the value to a committed configs/fms.yaml
+# and change ONLY the body of get_fms_connection_string() to read
+# from config_loader. Nothing that calls the accessor needs to
+# change - that's the whole point of going through a function.
+# ---------------------------------------------------------------
+FMS_CONNECTION_STRING = (
+    "DRIVER={ODBC Driver 17 for SQL Server};"
+    "SERVER=fmsdb.internal;"          # TODO: confirm actual server name
+    "DATABASE=FMS_PROD;"              # TODO: confirm actual database name
+    "Trusted_Connection=yes;"
+)
+
+# Timeouts (seconds) - kept conservative because FMS is shared.
+LOGIN_TIMEOUT_S = 10
+QUERY_TIMEOUT_S = 120
 
 
-def assert_fms() -> None:
-    """Refuse to run on machines where FMS access is disabled."""
-    cfg = load_machine_config()
-    fms = cfg.get("fms") or {}
-    if not fms.get("enabled"):
-        raise FMSConfigError(
-            "fms.enabled is False or missing in machine_config; "
-            "FMS pipelines refuse to run on this machine"
-        )
+def get_fms_connection_string() -> str:
+    """
+    Single read-point for the FMS connection string.
 
-
-def _build_conn_str() -> tuple[str, int, int]:
-    """Returns (conn_str, query_timeout_s, login_timeout_s)."""
-    cfg = load_machine_config()
-    fms = cfg.get("fms") or {}
-
-    required = ("driver", "server", "database", "auth")
-    missing = [k for k in required if not fms.get(k)]
-    if missing:
-        raise FMSConfigError(f"machine_config.fms missing keys: {missing}")
-
-    parts = [
-        f"DRIVER={{{fms['driver']}}}",
-        f"SERVER={fms['server']}",
-        f"DATABASE={fms['database']}",
-    ]
-
-    auth = fms["auth"]
-    if auth == "windows":
-        parts.append("Trusted_Connection=yes")
-    elif auth == "sql":
-        if not fms.get("username") or not fms.get("password"):
-            raise FMSConfigError("fms.auth=sql requires username and password")
-        parts.append(f"UID={fms['username']}")
-        parts.append(f"PWD={fms['password']}")
-    else:
-        raise FMSConfigError(f"unknown fms.auth: {auth!r}")
-
-    conn_str      = ";".join(parts) + ";"
-    query_timeout = int(fms.get("query_timeout_s", 120))
-    login_timeout = int(fms.get("login_timeout_s", 10))
-    return conn_str, query_timeout, login_timeout
+    Today this returns the module constant. To move the value into
+    config later, swap the body to read from config_loader and
+    leave every caller untouched.
+    """
+    conn_str = FMS_CONNECTION_STRING
+    if not conn_str or not conn_str.strip():
+        raise RuntimeError("FMS connection string is empty - check fms.py")
+    return conn_str
 
 
 @contextmanager
-def fms_connection() -> Iterator[pyodbc.Connection]:
+def get_fms_connection() -> Iterator[pyodbc.Connection]:
     """
     Context-managed read-only connection to FMS. Always closes,
-    even on exception. Login + query timeouts set from config.
+    even on exception. Login + query timeouts set from constants
+    above; FMS is shared, so we never block the scheduler.
     """
-    assert_fms()
-    conn_str, query_timeout, login_timeout = _build_conn_str()
-    logger.debug(f"opening FMS connection (login_timeout={login_timeout}s)")
-    conn = pyodbc.connect(conn_str, timeout=login_timeout, readonly=True)
-    conn.timeout = query_timeout
+    conn_str = get_fms_connection_string()
+    logger.debug(f"opening FMS connection (login_timeout={LOGIN_TIMEOUT_S}s)")
+    conn = pyodbc.connect(conn_str, timeout=LOGIN_TIMEOUT_S, readonly=True)
+    conn.timeout = QUERY_TIMEOUT_S
     try:
         yield conn
     finally:
@@ -119,7 +107,7 @@ def call_sproc(
 
     Retries transient errors (timeouts, deadlocks, dropped conns)
     with linear backoff. Does NOT retry logical errors (bad params,
-    permission denied) — those bubble immediately.
+    permission denied) - those bubble immediately.
     """
     placeholders = ",".join("?" * len(params)) if params else ""
     sql = f"EXEC {sproc_name} {placeholders}".strip()
@@ -128,7 +116,7 @@ def call_sproc(
     while True:
         attempt += 1
         try:
-            with fms_connection() as conn:
+            with get_fms_connection() as conn:
                 cur = conn.cursor()
                 t0 = time.monotonic()
                 logger.info(f"calling sproc {sproc_name} (attempt {attempt})")
