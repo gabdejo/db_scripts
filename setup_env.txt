@@ -1,0 +1,178 @@
+@echo off
+setlocal EnableDelayedExpansion
+
+REM ============================================================
+REM  CONFIGURATION - edit these to match your filenames
+REM ============================================================
+
+REM Source zips live in the user's Downloads folder
+set "SRC_DIR=%USERPROFILE%\Downloads"
+
+REM Name of the full Python zip (edit me)
+set "PYTHON_ZIP=python-3.10.6-full.zip"
+
+REM Name of the wheels zip - must contain requirements.txt + .whl files (edit me)
+set "WHEELS_ZIP=wheels.zip"
+
+REM Base destination under the user's Documents folder
+set "DOCS=%USERPROFILE%\Documents\Python"
+
+REM Where the unzipped Python goes
+set "PYTHON_DEST=%DOCS%\Versiones\3106"
+
+REM Where the virtual environment will be created
+set "VENV_DIR=%DOCS%\Env\profu310_env"
+
+REM Where the wheels folder ends up
+set "LIBRARY_DEST=%DOCS%\Library"
+
+REM Relative path to python.exe inside the unzipped Python folder.
+REM For a full Python it's usually "python.exe" at the root.
+REM Change to "Scripts\python.exe" only if your zip really puts it there.
+set "PYTHON_EXE_REL=python.exe"
+
+REM ============================================================
+REM  END CONFIGURATION
+REM ============================================================
+
+echo.
+echo === Python Environment Setup ===
+echo Source folder: %SRC_DIR%
+echo.
+
+REM --- Sanity checks ---
+if not exist "%SRC_DIR%\%PYTHON_ZIP%" (
+    echo [ERROR] Python zip not found: %SRC_DIR%\%PYTHON_ZIP%
+    goto :fail
+)
+if not exist "%SRC_DIR%\%WHEELS_ZIP%" (
+    echo [ERROR] Wheels zip not found: %SRC_DIR%\%WHEELS_ZIP%
+    goto :fail
+)
+
+REM ------------------------------------------------------------
+REM  STEP 1: Unzip Python into Documents\Python\Versiones\3106
+REM ------------------------------------------------------------
+echo [1/5] Extracting Python to "%PYTHON_DEST%"...
+if exist "%PYTHON_DEST%" (
+    echo       Target already exists, removing old copy...
+    rmdir /s /q "%PYTHON_DEST%"
+)
+mkdir "%PYTHON_DEST%" 2>nul
+powershell -NoProfile -Command ^
+    "Expand-Archive -LiteralPath '%SRC_DIR%\%PYTHON_ZIP%' -DestinationPath '%PYTHON_DEST%' -Force"
+if errorlevel 1 (
+    echo [ERROR] Failed to extract Python zip.
+    goto :fail
+)
+
+REM Some zips wrap everything in a single top-level subfolder.
+REM Detect that case and flatten it so python.exe sits where we expect.
+call :flatten_if_nested "%PYTHON_DEST%"
+
+set "PYTHON_EXE=%PYTHON_DEST%\%PYTHON_EXE_REL%"
+if not exist "%PYTHON_EXE%" (
+    echo [ERROR] python.exe not found at: %PYTHON_EXE%
+    echo         Check PYTHON_EXE_REL in the config section.
+    goto :fail
+)
+echo       Using python: "%PYTHON_EXE%"
+
+REM ------------------------------------------------------------
+REM  STEP 2: Create the virtual environment
+REM ------------------------------------------------------------
+echo [2/5] Creating venv at "%VENV_DIR%"...
+if exist "%VENV_DIR%" (
+    echo       Venv already exists, removing old copy...
+    rmdir /s /q "%VENV_DIR%"
+)
+mkdir "%DOCS%\Env" 2>nul
+"%PYTHON_EXE%" -m venv "%VENV_DIR%"
+if errorlevel 1 (
+    echo [ERROR] venv creation failed. Does this Python have the venv module?
+    goto :fail
+)
+
+REM ------------------------------------------------------------
+REM  STEP 3: Unzip wheels, then move/rename into Documents\Python\Library
+REM ------------------------------------------------------------
+echo [3/5] Extracting wheels...
+set "WHEELS_TMP=%TEMP%\wheels_extract_%RANDOM%"
+mkdir "%WHEELS_TMP%" 2>nul
+powershell -NoProfile -Command ^
+    "Expand-Archive -LiteralPath '%SRC_DIR%\%WHEELS_ZIP%' -DestinationPath '%WHEELS_TMP%' -Force"
+if errorlevel 1 (
+    echo [ERROR] Failed to extract wheels zip.
+    goto :fail
+)
+call :flatten_if_nested "%WHEELS_TMP%"
+
+echo       Moving wheels into "%LIBRARY_DEST%"...
+if exist "%LIBRARY_DEST%" (
+    echo       Library folder already exists, removing old copy...
+    rmdir /s /q "%LIBRARY_DEST%"
+)
+mkdir "%DOCS%" 2>nul
+move "%WHEELS_TMP%" "%LIBRARY_DEST%"
+if errorlevel 1 (
+    echo [ERROR] Failed to move wheels to Library.
+    goto :fail
+)
+
+REM ------------------------------------------------------------
+REM  STEP 4: Activate the venv
+REM ------------------------------------------------------------
+echo [4/5] Activating venv...
+call "%VENV_DIR%\Scripts\activate.bat"
+if errorlevel 1 (
+    echo [ERROR] Failed to activate venv.
+    goto :fail
+)
+
+REM ------------------------------------------------------------
+REM  STEP 5: Install from local wheels, fully offline
+REM ------------------------------------------------------------
+echo [5/5] Installing packages offline from "%LIBRARY_DEST%"...
+if not exist "%LIBRARY_DEST%\requirements.txt" (
+    echo [ERROR] requirements.txt not found in %LIBRARY_DEST%
+    goto :fail
+)
+python -m pip install --no-index --find-links "%LIBRARY_DEST%" -r "%LIBRARY_DEST%\requirements.txt"
+if errorlevel 1 (
+    echo [ERROR] pip install failed.
+    goto :fail
+)
+
+echo.
+echo === DONE ===
+echo Python:  %PYTHON_DEST%
+echo Venv:    %VENV_DIR%
+echo Library: %LIBRARY_DEST%
+echo.
+echo The venv is active in this window. Type "deactivate" to exit it.
+pause
+goto :eof
+
+REM ============================================================
+REM  Helper: if a folder contains exactly one subfolder and no
+REM  files, move that subfolder's contents up one level.
+REM ============================================================
+:flatten_if_nested
+set "TARGET=%~1"
+set "ITEMCOUNT=0"
+set "ONLYDIR="
+for /f "delims=" %%F in ('dir /b "%TARGET%"') do (
+    set /a ITEMCOUNT+=1
+    set "ONLYDIR=%%F"
+)
+if not "!ITEMCOUNT!"=="1" goto :eof
+if not exist "%TARGET%\!ONLYDIR!\" goto :eof
+echo       Flattening nested folder "!ONLYDIR!"...
+robocopy "%TARGET%\!ONLYDIR!" "%TARGET%" /e /move >nul
+goto :eof
+
+:fail
+echo.
+echo *** Setup aborted. ***
+pause
+exit /b 1
