@@ -8,16 +8,27 @@ REM ============================================================
 REM Source zips live in the user's Downloads folder
 set "SRC_DIR=%USERPROFILE%\Downloads"
 
-REM Name of the full Python zip (edit me)
-set "PYTHON_ZIP=python-3.10.6-full.zip"
+REM Name of the Python zip
+set "PYTHON_ZIP=py_versions-main.zip"
+
+REM Path INSIDE the zip where python.exe lives, relative to wherever
+REM the zip extracts. For your GitHub zip the layout is:
+REM   py_versions-main\py_versions-main\3106\python.exe
+REM so the path-to-python-folder inside the extraction is:
+set "PYTHON_SUBPATH=py_versions-main\3106"
 
 REM Name of the wheels zip - must contain requirements.txt + .whl files (edit me)
 set "WHEELS_ZIP=wheels.zip"
 
+REM Path INSIDE the wheels zip to the folder that actually contains
+REM the .whl files and requirements.txt. Leave empty if they're at
+REM the root of the extraction.
+set "WHEELS_SUBPATH="
+
 REM Base destination under the user's Documents folder
 set "DOCS=%USERPROFILE%\Documents\Python"
 
-REM Where the unzipped Python goes
+REM Where the Python folder ends up (the 3106 folder's CONTENTS go here)
 set "PYTHON_DEST=%DOCS%\Versiones\3106"
 
 REM Where the virtual environment will be created
@@ -26,9 +37,7 @@ set "VENV_DIR=%DOCS%\Env\profu310_env"
 REM Where the wheels folder ends up
 set "LIBRARY_DEST=%DOCS%\Library"
 
-REM Relative path to python.exe inside the unzipped Python folder.
-REM For a full Python it's usually "python.exe" at the root.
-REM Change to "Scripts\python.exe" only if your zip really puts it there.
+REM Relative path to python.exe inside PYTHON_DEST (usually just python.exe)
 set "PYTHON_EXE_REL=python.exe"
 
 REM ============================================================
@@ -51,29 +60,60 @@ if not exist "%SRC_DIR%\%WHEELS_ZIP%" (
 )
 
 REM ------------------------------------------------------------
-REM  STEP 1: Unzip Python into Documents\Python\Versiones\3106
+REM  STEP 1: Extract Python zip to a temp folder, then move the
+REM          inner Python folder to %PYTHON_DEST%
 REM ------------------------------------------------------------
-echo [1/5] Extracting Python to "%PYTHON_DEST%"...
-if exist "%PYTHON_DEST%" (
-    echo       Target already exists, removing old copy...
-    rmdir /s /q "%PYTHON_DEST%"
-)
-mkdir "%PYTHON_DEST%" 2>nul
+echo [1/5] Extracting Python...
+
+set "PY_TMP=%TEMP%\py_extract_%RANDOM%"
+if exist "%PY_TMP%" rmdir /s /q "%PY_TMP%"
+mkdir "%PY_TMP%" 2>nul
+
 powershell -NoProfile -Command ^
-    "Expand-Archive -LiteralPath '%SRC_DIR%\%PYTHON_ZIP%' -DestinationPath '%PYTHON_DEST%' -Force"
+    "Expand-Archive -LiteralPath '%SRC_DIR%\%PYTHON_ZIP%' -DestinationPath '%PY_TMP%' -Force"
 if errorlevel 1 (
     echo [ERROR] Failed to extract Python zip.
     goto :fail
 )
 
-REM Some zips wrap everything in a single top-level subfolder.
-REM Detect that case and flatten it so python.exe sits where we expect.
-call :flatten_if_nested "%PYTHON_DEST%"
+REM The zip extracts as py_versions-main\py_versions-main\3106\...
+REM Walk INTO the first subfolder (the outer wrapper), then look for
+REM PYTHON_SUBPATH (which is "py_versions-main\3106").
+call :find_single_subfolder "%PY_TMP%" OUTER
+if not defined OUTER (
+    echo [ERROR] Could not find expected wrapper folder inside the zip.
+    goto :fail
+)
+set "PY_SRC=%PY_TMP%\!OUTER!\%PYTHON_SUBPATH%"
+
+if not exist "%PY_SRC%\%PYTHON_EXE_REL%" (
+    echo [ERROR] python.exe not found at expected location:
+    echo         %PY_SRC%\%PYTHON_EXE_REL%
+    echo         Adjust PYTHON_SUBPATH in the config section.
+    echo.
+    echo Contents of "%PY_TMP%\!OUTER!":
+    dir /b "%PY_TMP%\!OUTER!"
+    goto :fail
+)
+
+echo       Moving Python to "%PYTHON_DEST%"...
+if exist "%PYTHON_DEST%" (
+    echo       Target already exists, removing old copy...
+    rmdir /s /q "%PYTHON_DEST%"
+)
+REM Make sure parent exists
+for %%P in ("%PYTHON_DEST%") do mkdir "%%~dpP" 2>nul
+move "%PY_SRC%" "%PYTHON_DEST%" >nul
+if errorlevel 1 (
+    echo [ERROR] Failed to move Python folder into place.
+    goto :fail
+)
+REM Clean up the temp extraction tree (leftover wrapper folders)
+rmdir /s /q "%PY_TMP%" 2>nul
 
 set "PYTHON_EXE=%PYTHON_DEST%\%PYTHON_EXE_REL%"
 if not exist "%PYTHON_EXE%" (
-    echo [ERROR] python.exe not found at: %PYTHON_EXE%
-    echo         Check PYTHON_EXE_REL in the config section.
+    echo [ERROR] python.exe missing after move: %PYTHON_EXE%
     goto :fail
 )
 echo       Using python: "%PYTHON_EXE%"
@@ -86,7 +126,7 @@ if exist "%VENV_DIR%" (
     echo       Venv already exists, removing old copy...
     rmdir /s /q "%VENV_DIR%"
 )
-mkdir "%DOCS%\Env" 2>nul
+for %%P in ("%VENV_DIR%") do mkdir "%%~dpP" 2>nul
 "%PYTHON_EXE%" -m venv "%VENV_DIR%"
 if errorlevel 1 (
     echo [ERROR] venv creation failed. Does this Python have the venv module?
@@ -94,10 +134,11 @@ if errorlevel 1 (
 )
 
 REM ------------------------------------------------------------
-REM  STEP 3: Unzip wheels, then move/rename into Documents\Python\Library
+REM  STEP 3: Extract wheels, move into Documents\Python\Library
 REM ------------------------------------------------------------
 echo [3/5] Extracting wheels...
 set "WHEELS_TMP=%TEMP%\wheels_extract_%RANDOM%"
+if exist "%WHEELS_TMP%" rmdir /s /q "%WHEELS_TMP%"
 mkdir "%WHEELS_TMP%" 2>nul
 powershell -NoProfile -Command ^
     "Expand-Archive -LiteralPath '%SRC_DIR%\%WHEELS_ZIP%' -DestinationPath '%WHEELS_TMP%' -Force"
@@ -105,19 +146,40 @@ if errorlevel 1 (
     echo [ERROR] Failed to extract wheels zip.
     goto :fail
 )
-call :flatten_if_nested "%WHEELS_TMP%"
+
+REM Decide which folder actually contains the wheels
+set "WHEELS_SRC=%WHEELS_TMP%"
+if defined WHEELS_SUBPATH (
+    set "WHEELS_SRC=%WHEELS_TMP%\%WHEELS_SUBPATH%"
+) else (
+    REM Auto-flatten if there's one wrapping folder
+    call :find_single_subfolder "%WHEELS_TMP%" WOUTER
+    if defined WOUTER (
+        if not exist "%WHEELS_TMP%\!WOUTER!\requirements.txt" (
+            REM Only treat as wrapper if there's no requirements.txt at top level
+            set "WHEELS_SRC=%WHEELS_TMP%\!WOUTER!"
+        )
+    )
+)
+
+if not exist "%WHEELS_SRC%\requirements.txt" (
+    echo [ERROR] requirements.txt not found at: %WHEELS_SRC%
+    echo         Adjust WHEELS_SUBPATH in the config section.
+    goto :fail
+)
 
 echo       Moving wheels into "%LIBRARY_DEST%"...
 if exist "%LIBRARY_DEST%" (
     echo       Library folder already exists, removing old copy...
     rmdir /s /q "%LIBRARY_DEST%"
 )
-mkdir "%DOCS%" 2>nul
-move "%WHEELS_TMP%" "%LIBRARY_DEST%"
+for %%P in ("%LIBRARY_DEST%") do mkdir "%%~dpP" 2>nul
+move "%WHEELS_SRC%" "%LIBRARY_DEST%" >nul
 if errorlevel 1 (
     echo [ERROR] Failed to move wheels to Library.
     goto :fail
 )
+rmdir /s /q "%WHEELS_TMP%" 2>nul
 
 REM ------------------------------------------------------------
 REM  STEP 4: Activate the venv
@@ -133,10 +195,6 @@ REM ------------------------------------------------------------
 REM  STEP 5: Install from local wheels, fully offline
 REM ------------------------------------------------------------
 echo [5/5] Installing packages offline from "%LIBRARY_DEST%"...
-if not exist "%LIBRARY_DEST%\requirements.txt" (
-    echo [ERROR] requirements.txt not found in %LIBRARY_DEST%
-    goto :fail
-)
 python -m pip install --no-index --find-links "%LIBRARY_DEST%" -r "%LIBRARY_DEST%\requirements.txt"
 if errorlevel 1 (
     echo [ERROR] pip install failed.
@@ -154,21 +212,27 @@ pause
 goto :eof
 
 REM ============================================================
-REM  Helper: if a folder contains exactly one subfolder and no
-REM  files, move that subfolder's contents up one level.
+REM  Helper: if %1 contains exactly one subfolder (and no files at
+REM  the top level), return that folder name in variable %2.
+REM  Otherwise %2 is left undefined.
 REM ============================================================
-:flatten_if_nested
+:find_single_subfolder
 set "TARGET=%~1"
+set "OUTVAR=%~2"
 set "ITEMCOUNT=0"
 set "ONLYDIR="
-for /f "delims=" %%F in ('dir /b "%TARGET%"') do (
+set "HAS_FILE=0"
+for /f "delims=" %%F in ('dir /b "%TARGET%" 2^>nul') do (
     set /a ITEMCOUNT+=1
-    set "ONLYDIR=%%F"
+    if exist "%TARGET%\%%F\" (
+        set "ONLYDIR=%%F"
+    ) else (
+        set "HAS_FILE=1"
+    )
 )
-if not "!ITEMCOUNT!"=="1" goto :eof
-if not exist "%TARGET%\!ONLYDIR!\" goto :eof
-echo       Flattening nested folder "!ONLYDIR!"...
-robocopy "%TARGET%\!ONLYDIR!" "%TARGET%" /e /move >nul
+if "!ITEMCOUNT!"=="1" if "!HAS_FILE!"=="0" (
+    set "%OUTVAR%=!ONLYDIR!"
+)
 goto :eof
 
 :fail
