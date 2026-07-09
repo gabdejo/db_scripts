@@ -1,31 +1,29 @@
 # src/pipeline/positions/fms/forwards/run.py
 # ---------------------------------------------------------------
-# Orchestrator for the FMS forwards pipeline.
+# Callable run wrapper for the FMS forwards pipeline.
 #
-# Default mode:
+# Two modes, both exposed as callables. The entry-point script
+# (scripts/run_fms_forwards.py) is the argparse shell that calls
+# these; nothing here does argparse or __main__.
+#
+# run_full(start_date, end_date, force)
 #   1. Assert FMS ingestion enabled on this machine
 #   2. Build batch_id from timestamp
-#   3. Extract from FMS for --start-date..--end-date
+#   3. Extract from FMS for start_date..end_date
 #   4. Transform to staging shape
 #   5. Load staging (idempotent upsert)
 #   6. Load dim_portfolio (fms slice) into memory
 #   7. Transform to fact shape (portfolio resolution)
 #   8. Load fact (idempotent upsert)
+#   9. Flip any backfill-pending portfolios to active
 #
-# Flags:
-#   --start-date YYYY-MM-DD    required unless --from-stg
-#   --end-date YYYY-MM-DD      required unless --from-stg
-#   --from-stg                 skip 1-5, read staging by batch_id
-#   --batch-id STR             required with --from-stg
-#   --force                    override MAX_RANGE_DAYS guard
-#
-# from-stg mode: bypasses FMS entirely. Reads existing staging
-# rows by batch_id, transforms to fact shape, upserts fact. Used
-# to rebuild fact after fixing a portfolio registration or MTM
-# source without re-hitting FMS.
+# run_from_stg(batch_id)
+#   Bypasses FMS entirely. Reads existing staging rows by
+#   batch_id, transforms to fact shape, upserts fact. Used to
+#   rebuild fact after fixing a portfolio registration or MTM
+#   source without re-hitting FMS.
 # ---------------------------------------------------------------
 
-import argparse
 import logging
 from datetime import date, datetime
 
@@ -38,17 +36,13 @@ from src.pipeline.positions.fms.forwards import extract, transform, loader
 logger = logging.getLogger(__name__)
 
 
-def main() -> None:
-    args = _parse_args()
+def run_full(start_date: date, end_date: date, force: bool = False) -> None:
+    """
+    Full pipeline: extract from FMS, load staging, load fact.
+    Idempotent - safe to re-run for the same date range.
+    """
     assert_fms_ingestion()
 
-    if args.from_stg:
-        _run_from_staging(args.batch_id)
-    else:
-        _run_full(args.start_date, args.end_date, args.force)
-
-
-def _run_full(start_date: date, end_date: date, force: bool) -> None:
     batch_id = _new_batch_id()
     logger.info(f"batch_id={batch_id} start={start_date} end={end_date} force={force}")
 
@@ -69,7 +63,11 @@ def _run_full(start_date: date, end_date: date, force: bool) -> None:
         _flip_backfill_pending_to_active(conn, fact_df)
 
 
-def _run_from_staging(batch_id: str) -> None:
+def run_from_stg(batch_id: str) -> None:
+    """
+    Rebuild fact from an existing staging batch, without re-hitting FMS.
+    """
+    assert_fms_ingestion()
     logger.info(f"from-stg mode: batch_id={batch_id}")
 
     with get_connection() as conn:
@@ -150,30 +148,3 @@ def _flip_backfill_pending_to_active(conn, fact_df: pd.DataFrame) -> None:
         flipped = cur.rowcount
     if flipped:
         logger.info(f"flipped {flipped} FMS portfolios from backfill-pending to active")
-
-
-def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser()
-    p.add_argument("--start-date", type=date.fromisoformat)
-    p.add_argument("--end-date", type=date.fromisoformat)
-    p.add_argument("--from-stg", action="store_true")
-    p.add_argument("--batch-id", type=str)
-    p.add_argument("--force", action="store_true")
-    args = p.parse_args()
-
-    if args.from_stg:
-        if not args.batch_id:
-            p.error("--from-stg requires --batch-id")
-    else:
-        if not (args.start_date and args.end_date):
-            p.error("--start-date and --end-date are required unless --from-stg")
-
-    return args
-
-
-if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(name)s %(levelname)s %(message)s",
-    )
-    main()
