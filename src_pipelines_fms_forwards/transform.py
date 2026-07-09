@@ -20,6 +20,7 @@
 import json
 import logging
 from datetime import date
+from decimal import Decimal
 
 import pandas as pd
 
@@ -190,6 +191,8 @@ def _to_json_value(v):
     """Coerce a pandas cell value to a JSON-serializable primitive."""
     if pd.isna(v):
         return None
+    if isinstance(v, Decimal):
+        return float(v)
     if hasattr(v, "isoformat"):  # date/datetime
         return v.isoformat()
     if hasattr(v, "item"):  # numpy scalar
