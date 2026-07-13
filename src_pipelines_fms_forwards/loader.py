@@ -13,17 +13,22 @@
 #   (portfolio_id, codigo_sbs, date, source). Restatements land
 #   cleanly - matches the fact_positions upsert-DO-UPDATE policy.
 #
-# Both use psycopg execute_values for batched inserts. Both accept
-# an already-open connection (caller controls the transaction);
-# empty DataFrames are no-ops.
+# Both iterate the DataFrame row-by-row and call cur.execute per
+# row. This matches the pattern used by the Bloomberg prices
+# pipeline and keeps consistency across the ETL. Slower per-row
+# than batched inserts, but bounded by columns-per-statement
+# (never trips Postgres's 65535 parameter cap), simpler to
+# debug, and per-row errors point at the specific offending row.
+#
+# Both accept an already-open connection (caller controls the
+# transaction); empty DataFrames are no-ops.
 # ---------------------------------------------------------------
 
 import logging
 
 import pandas as pd
-from psycopg.types.json import Jsonb
-from psycopg_pool import ConnectionPool  # type hint only; caller injects
 from psycopg import Connection
+from psycopg.types.json import Jsonb
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +44,7 @@ STG_COLUMNS = [
 
 STG_UPSERT = f"""
 INSERT INTO stg_positions_fms_forwards ({", ".join(STG_COLUMNS)})
-VALUES %s
+VALUES ({", ".join(["%s"] * len(STG_COLUMNS))})
 ON CONFLICT (codigo_fondo, codigo_sbs, date) DO UPDATE SET
     batch_id                      = EXCLUDED.batch_id,
     loaded_at                     = CURRENT_TIMESTAMP,
@@ -65,7 +70,7 @@ FACT_COLUMNS = [
 
 FACT_UPSERT = f"""
 INSERT INTO fact_positions_forwards ({", ".join(FACT_COLUMNS)})
-VALUES %s
+VALUES ({", ".join(["%s"] * len(FACT_COLUMNS))})
 ON CONFLICT (portfolio_id, codigo_sbs, date, source) DO UPDATE SET
     codigo_iso_moneda_nocional = EXCLUDED.codigo_iso_moneda_nocional,
     valor_nocional             = EXCLUDED.valor_nocional,
@@ -87,13 +92,10 @@ def load_staging(conn: Connection, stg_df: pd.DataFrame) -> int:
         logger.info("load_staging: empty DataFrame, nothing to write")
         return 0
 
-    rows = _df_to_tuples(stg_df, STG_COLUMNS, jsonb_column="raw_payload")
-    with conn.cursor() as cur:
-        # psycopg3 does not ship execute_values - use executemany with a
-        # rewritten multi-row INSERT for the batched path.
-        _execute_batch_upsert(cur, STG_UPSERT, rows)
-    logger.info(f"load_staging: upserted {len(rows)} rows into stg_positions_fms_forwards")
-    return len(rows)
+    _validate_columns(stg_df, STG_COLUMNS)
+    n = _execute_row_by_row(conn, STG_UPSERT, stg_df, STG_COLUMNS, jsonb_column="raw_payload")
+    logger.info(f"load_staging: upserted {n} rows into stg_positions_fms_forwards")
+    return n
 
 
 def load_fact(conn: Connection, fact_df: pd.DataFrame) -> int:
@@ -102,51 +104,50 @@ def load_fact(conn: Connection, fact_df: pd.DataFrame) -> int:
         logger.info("load_fact: empty DataFrame, nothing to write")
         return 0
 
-    rows = _df_to_tuples(fact_df, FACT_COLUMNS)
-    with conn.cursor() as cur:
-        _execute_batch_upsert(cur, FACT_UPSERT, rows)
-    logger.info(f"load_fact: upserted {len(rows)} rows into fact_positions_forwards")
-    return len(rows)
+    _validate_columns(fact_df, FACT_COLUMNS)
+    n = _execute_row_by_row(conn, FACT_UPSERT, fact_df, FACT_COLUMNS)
+    logger.info(f"load_fact: upserted {n} rows into fact_positions_forwards")
+    return n
 
 
-def _df_to_tuples(df: pd.DataFrame, columns: list[str], jsonb_column: str = None) -> list[tuple]:
-    """
-    Convert a DataFrame to a list of tuples in the order of `columns`.
-    NaN/NaT converted to None. If jsonb_column is specified, that
-    column's values are wrapped in psycopg's Jsonb adapter.
-    """
-    missing = [c for c in columns if c not in df.columns]
+def _validate_columns(df: pd.DataFrame, expected: list[str]) -> None:
+    missing = [c for c in expected if c not in df.columns]
     if missing:
         raise ValueError(f"DataFrame missing expected columns: {missing}")
 
+
+def _execute_row_by_row(
+    conn: Connection,
+    sql: str,
+    df: pd.DataFrame,
+    columns: list[str],
+    jsonb_column: str = None,
+) -> int:
+    """
+    Iterate the DataFrame row-by-row and execute one INSERT per row.
+    Matches the pattern used by the Bloomberg prices pipeline.
+    NaN/NaT converted to None. jsonb_column values wrapped in Jsonb.
+    """
+    with conn.cursor() as cur:
+        for i, row in df.iterrows():
+            params = _row_to_params(row, columns, jsonb_column)
+            try:
+                cur.execute(sql, params)
+            except Exception:
+                logger.error(f"insert failed for DataFrame row {i}: {dict(row[columns])}")
+                raise
+    return len(df)
+
+
+def _row_to_params(row: pd.Series, columns: list[str], jsonb_column: str = None) -> tuple:
+    """Convert a DataFrame row to a psycopg-ready parameter tuple."""
     out = []
-    for _, row in df[columns].iterrows():
-        rec = []
-        for col in columns:
-            v = row[col]
-            if pd.isna(v):
-                rec.append(None)
-            elif col == jsonb_column:
-                rec.append(Jsonb(v))
-            else:
-                rec.append(v.item() if hasattr(v, "item") else v)
-        out.append(tuple(rec))
-    return out
-
-
-def _execute_batch_upsert(cur, sql_template: str, rows: list[tuple]) -> None:
-    """
-    Execute a batched INSERT ... VALUES %s statement.
-
-    psycopg3 doesn't have psycopg2's execute_values. We build a
-    literal multi-row VALUES clause using cur.executemany's replacement
-    by constructing the placeholder string ourselves.
-    """
-    if not rows:
-        return
-    n_cols = len(rows[0])
-    placeholder = "(" + ", ".join(["%s"] * n_cols) + ")"
-    values_clause = ", ".join([placeholder] * len(rows))
-    flat = [v for row in rows for v in row]
-    sql = sql_template.replace("VALUES %s", f"VALUES {values_clause}")
-    cur.execute(sql, flat)
+    for col in columns:
+        v = row[col]
+        if pd.isna(v):
+            out.append(None)
+        elif col == jsonb_column:
+            out.append(Jsonb(v))
+        else:
+            out.append(v.item() if hasattr(v, "item") else v)
+    return tuple(out)
